@@ -1,0 +1,20 @@
+# Allow access to output directory
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /send/voice-speechify/
+</IfModule>
+
+# Allow PHP execution
+<Files "api.php">
+    Order allow,deny
+    Allow from all
+</Files>
+
+# Allow access to output files
+<Directory "output">
+    Options Indexes FollowSymLinks
+    AllowOverride None
+    Order allow,deny
+    Allow from all
+</Directory>
+
