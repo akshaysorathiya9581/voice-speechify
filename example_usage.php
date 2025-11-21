@@ -39,8 +39,8 @@ $generator = new SpeechifyMultiVoice($apiKey);
 // Alternatively, set custom voices after creation:
 // $generator->setVoices('sarah', 'david');  // Female: sarah, Male: david
 // Or set individually:
-// $generator->setVoice('1', 'sarah');  // Set female voice (prefix 1)
-// $generator->setVoice('2', 'david');  // Set male voice (prefix 2)
+$generator->setVoice('1', 'sarah');  // Set female voice (prefix 1)
+$generator->setVoice('2', 'david');  // Set male voice (prefix 2)
 
 // Common voice IDs to try:
 // Female: 'oliver', 'sarah', 'luna', 'emma', 'sophia'
