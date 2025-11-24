@@ -22,6 +22,9 @@ class SpeechifyMultiVoice {
     private $apiUrl = 'https://api.sws.speechify.com/v1/audio/speech';
     private $verifySSL = false;
     private $outputDir;
+    private $lastApiError = '';
+    private $maxRetries = 3;
+    private $retryDelaySeconds = 2;
     
     // Voice mappings - using default working voices
     // You can customize these by calling setVoice() method
@@ -97,6 +100,7 @@ class SpeechifyMultiVoice {
         $lines = explode("\n", $text);
         $currentVoice = null;
         $currentText = '';
+        $foundPrefixedLine = false;
         
         foreach ($lines as $line) {
             $line = trim($line);
@@ -111,6 +115,7 @@ class SpeechifyMultiVoice {
             
             // Check if line starts with voice prefix (1 or 2)
             if (preg_match('/^([12])\s+(.+)$/', $line, $matches)) {
+                $foundPrefixedLine = true;
                 // Save previous segment if exists
                 if ($currentVoice !== null && !empty(trim($currentText))) {
                     $segments[] = [
@@ -138,6 +143,22 @@ class SpeechifyMultiVoice {
             ];
         }
         
+        if (empty($segments) && !$foundPrefixedLine) {
+            $fallbackVoice = isset($this->voices['1']) ? '1' : null;
+            if ($fallbackVoice === null) {
+                foreach ($this->voices as $voiceKey => $_) {
+                    $fallbackVoice = $voiceKey;
+                    break;
+                }
+            }
+            if (!empty(trim($text)) && $fallbackVoice !== null) {
+                $segments[] = [
+                    'voice' => $fallbackVoice,
+                    'text' => trim($text)
+                ];
+            }
+        }
+        
         return $segments;
     }
     
@@ -145,33 +166,14 @@ class SpeechifyMultiVoice {
      * Build SSML for a text segment
      * 
      * @param string $text The text content
-     * @param string $voice The voice identifier (1 or 2)
+     * @param string $voiceId Resolved Speechify voice ID
      * @param string $language Language code (e.g., 'en-US')
      * @return string SSML formatted string
      */
-    public function buildSSML($text, $voice, $language = 'en-US') {
-        // Start SSML
-        $ssml = '<speak>';
-        
-        // Add refinement prompt for English (US)
-        if ($language === 'en-US') {
-            $ssml .= '<prosody rate="medium" pitch="medium">';
-            $ssml .= 'Read this in a warm, friendly tone with American accent. ';
-            $ssml .= '</prosody>';
-        }
-        
-        // Add pause before main content
-        $ssml .= '<break time="300ms"/>';
-        
-        // Main content with prosody
-        $ssml .= '<prosody rate="medium" pitch="medium" volume="medium">';
-        $ssml .= htmlspecialchars($text, ENT_XML1, 'UTF-8');
-        $ssml .= '</prosody>';
-        
-        // Add pause after content
-        $ssml .= '<break time="500ms"/>';
-        
-        $ssml .= '</speak>';
+    public function buildSSML($text, $voiceId, $language = 'en-US') {
+        // Use minimal SSML - just wrap the text, no voice tags or prosody
+        // Voice is specified in API call, prosody/instructions via ai_instruction parameter
+        $ssml = '<speak>' . htmlspecialchars($text, ENT_XML1, 'UTF-8') . '</speak>';
         
         return $ssml;
     }
@@ -185,13 +187,19 @@ class SpeechifyMultiVoice {
      * @return string|false Audio binary data or false on error
      */
     public function callSpeechifyAPI($ssml, $voiceId, $language = 'en-US') {
+        // Extract plain text from SSML for cleaner input
+        $plainText = strip_tags($ssml);
+        $plainText = html_entity_decode($plainText, ENT_QUOTES | ENT_XML1, 'UTF-8');
+        $plainText = trim($plainText);
+        
         $payload = [
-            'input' => $ssml,
+            'input' => $plainText,  // Only the actual text to be spoken - NO refinement prompt here
             'voice_id' => $voiceId,
             'language' => $language
         ];
         
-        // Add AI instruction for English (US)
+        // Add AI instruction for English (US) - this is sent as a separate parameter
+        // It guides the voice tone/style but should NOT be spoken in the audio
         if ($language === 'en-US') {
             $payload['ai_instruction'] = 'Read this in a warm, friendly tone with American accent.';
         }
@@ -208,6 +216,8 @@ class SpeechifyMultiVoice {
                 "Content-Type: application/json",
                 "Accept: audio/mpeg"
             ],
+            CURLOPT_TIMEOUT => 60,
+            CURLOPT_CONNECTTIMEOUT => 15
         ];
         
         // SSL certificate options
@@ -225,6 +235,7 @@ class SpeechifyMultiVoice {
         curl_close($ch);
         
         if ($error) {
+            $this->lastApiError = "cURL error: $error";
             error_log("Speechify API cURL error: $error");
             return false;
         }
@@ -241,8 +252,11 @@ class SpeechifyMultiVoice {
                 error_log("Speechify API error: $errorMsg");
             }
             
+            $this->lastApiError = $errorMsg;
             return false;
         }
+        
+        $this->lastApiError = '';
         
         // Try to decode as JSON first (some APIs return JSON with base64 audio)
         $responseData = json_decode($response, true);
@@ -270,7 +284,11 @@ class SpeechifyMultiVoice {
         
         // Try FFmpeg first (most reliable)
         if ($this->hasFFmpeg()) {
-            return $this->concatenateWithFFmpeg($audioFiles, $outputFile);
+            if ($this->concatenateWithFFmpeg($audioFiles, $outputFile)) {
+                return true;
+            }
+            
+            error_log('FFmpeg concatenation failed, falling back to binary merge.');
         }
         
         // Fallback to binary concatenation (works for compatible MP3s)
@@ -313,17 +331,24 @@ class SpeechifyMultiVoice {
         
         file_put_contents($fileList, $fileListContent);
         
-        // Use FFmpeg concat demuxer
+        $fileListArg = $this->escapeShellArg($fileList);
+        $outputArg = $this->escapeShellArg($outputFile);
+        
+        // Re-encode while concatenating to eliminate encoder delay pops
         $ffmpegCmd = sprintf(
-            'ffmpeg -f concat -safe 0 -i "%s" -c copy "%s" 2>&1',
-            escapeshellarg($fileList),
-            escapeshellarg($outputFile)
+            'ffmpeg -hide_banner -loglevel warning -y -f concat -safe 0 -i %s -c:a libmp3lame -b:a 192k -ar 44100 -ac 2 %s 2>&1',
+            $fileListArg,
+            $outputArg
         );
         
         exec($ffmpegCmd, $output, $returnCode);
         
         // Clean up file list
         @unlink($fileList);
+        
+        if ($returnCode !== 0) {
+            error_log('FFmpeg error: ' . implode("\n", $output));
+        }
         
         return $returnCode === 0 && file_exists($outputFile) && filesize($outputFile) > 0;
     }
@@ -396,13 +421,14 @@ class SpeechifyMultiVoice {
             $voiceId = $this->voices[$voice];
             
             // Build SSML
-            $ssml = $this->buildSSML($text, $voice, $language);
+            $ssml = $this->buildSSML($text, $voiceId, $language);
             
-            // Call API
-            $audioData = $this->callSpeechifyAPI($ssml, $voiceId, $language);
+            // Call API with retry logic
+            $audioData = $this->requestAudioWithRetries($ssml, $voiceId, $language);
             
             if ($audioData === false) {
-                $errors[] = "Segment " . ($index + 1) . " (Voice $voiceId): Failed to generate audio";
+                $errorMsg = $this->lastApiError ?: 'Failed to generate audio';
+                $errors[] = "Segment " . ($index + 1) . " (Voice $voiceId): $errorMsg";
                 continue;
             }
             
@@ -447,6 +473,53 @@ class SpeechifyMultiVoice {
             'segments_processed' => count($segments),
             'errors' => $errors
         ];
+    }
+
+    /**
+     * Helper to request audio with retries
+     * 
+     * @param string $ssml
+     * @param string $voiceId
+     * @param string $language
+     * @return string|false
+     */
+    private function requestAudioWithRetries($ssml, $voiceId, $language) {
+        for ($attempt = 1; $attempt <= $this->maxRetries; $attempt++) {
+            $audioData = $this->callSpeechifyAPI($ssml, $voiceId, $language);
+            
+            if ($audioData !== false && strlen($audioData) > 0) {
+                return $audioData;
+            }
+            
+            if ($attempt < $this->maxRetries) {
+                sleep($this->retryDelaySeconds * $attempt);
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Escape shell arguments cross-platform
+     * 
+     * @param string $argument
+     * @return string
+     */
+    private function escapeShellArg($argument) {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            return '"' . str_replace('"', '""', $argument) . '"';
+        }
+        
+        return escapeshellarg($argument);
+    }
+    
+    /**
+     * Retrieve the last API error message
+     * 
+     * @return string
+     */
+    public function getLastApiError() {
+        return $this->lastApiError;
     }
 }
 
