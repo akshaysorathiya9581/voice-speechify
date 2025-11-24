@@ -14,7 +14,7 @@ require_once __DIR__ . '/speechify_multi_voice.php';
 $isCLI = php_sapi_name() === 'cli';
 
 // Your Speechify API key
-$apiKey = 'VbH870ZEHj2AT31wx4elnp3ImLh1DI94C5AyY6TPEEg=';
+$apiKey = '';
 
 // Example text with voice prefixes
 // 1 = Female voice (default: oliver)
