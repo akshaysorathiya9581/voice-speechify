@@ -368,7 +368,7 @@ class SpeechifyMultiVoice {
         }
         
         $success = true;
-        foreach ($audioFiles as $audioFile) {
+        foreach ($audioFiles as $index => $audioFile) {
             if (!file_exists($audioFile)) {
                 $success = false;
                 continue;
@@ -378,6 +378,15 @@ class SpeechifyMultiVoice {
             if ($audioData === false) {
                 $success = false;
                 continue;
+            }
+            
+            // Strip metadata headers from every file except the first one to avoid audible pops
+            if ($index > 0) {
+                $audioData = $this->stripMp3Headers($audioData);
+                if ($audioData === '') {
+                    $success = false;
+                    continue;
+                }
             }
             
             // For MP3, we can try simple binary concatenation
@@ -390,6 +399,42 @@ class SpeechifyMultiVoice {
         fclose($outputHandle);
         
         return $success && file_exists($outputFile) && filesize($outputFile) > 0;
+    }
+    
+    /**
+     * Remove MP3 headers (ID3v2/ID3v1) that cause audible artifacts when concatenating
+     * Only used for non-leading chunks so the final file keeps a single header.
+     *
+     * @param string $audioData
+     * @return string
+     */
+    private function stripMp3Headers($audioData) {
+        $dataLength = strlen($audioData);
+        
+        // Remove ID3v2 header at the start (if present)
+        if ($dataLength >= 10 && substr($audioData, 0, 3) === 'ID3') {
+            $sizeBytes = substr($audioData, 6, 4);
+            if (strlen($sizeBytes) === 4) {
+                $size = 0;
+                for ($i = 0; $i < 4; $i++) {
+                    $size = ($size << 7) | (ord($sizeBytes[$i]) & 0x7F);
+                }
+                $headerSize = 10 + $size;
+                if ($headerSize < $dataLength) {
+                    $audioData = substr($audioData, $headerSize);
+                    $dataLength = strlen($audioData);
+                } else {
+                    return '';
+                }
+            }
+        }
+        
+        // Remove ID3v1 tag at the end (128 bytes) if present
+        if ($dataLength >= 128 && substr($audioData, -128, 3) === 'TAG') {
+            $audioData = substr($audioData, 0, -128);
+        }
+        
+        return $audioData;
     }
     
     /**
